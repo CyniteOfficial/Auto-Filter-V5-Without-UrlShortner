@@ -1,7 +1,7 @@
 import logging
 from pyrogram.errors import InputUserDeactivated, UserNotParticipant, FloodWait, UserIsBlocked, PeerIdInvalid
-from info import AUTH_CHANNEL, LONG_IMDB_DESCRIPTION, MAX_LIST_ELM, URL_SHORTENR_WEBSITE, URL_SHORTNER_WEBSITE_API
-from imdb import IMDb
+from info import AUTH_CHANNEL, LONG_IMDB_DESCRIPTION, MAX_LIST_ELM
+from imdb import Cinemagoer
 import asyncio
 from pyrogram.types import Message, InlineKeyboardButton
 from pyrogram import enums
@@ -13,7 +13,6 @@ from typing import List
 from database.users_chats_db import db
 from bs4 import BeautifulSoup
 import requests
-import aiohttp
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -22,7 +21,7 @@ BTN_URL_REGEX = re.compile(
     r"(\[([^\[]+?)\]\((buttonurl|buttonalert):(?:/{0,2})(.+?)(:same)?\))"
 )
 
-imdb = IMDb() 
+imdb = Cinemagoer() 
 
 BANNED = {}
 SMART_OPEN = '“'
@@ -39,6 +38,7 @@ class temp(object):
     MELCOW = {}
     U_NAME = None
     B_NAME = None
+    B_LINK = None
     SETTINGS = {}
 
 async def is_subscribed(bot, query):
@@ -49,7 +49,7 @@ async def is_subscribed(bot, query):
     except Exception as e:
         logger.exception(e)
     else:
-        if user.status != 'kicked':
+        if user.status != enums.ChatMemberStatus.BANNED:
             return True
 
     return False
@@ -134,6 +134,19 @@ async def get_poster(query, bulk=False, id=False, file=None):
     }
 # https://github.com/odysseusmax/animated-lamp/blob/2ef4730eb2b5f0596ed6d03e7b05243d93e3415b/bot/utils/broadcast.py#L37
 
+async def search_gagala(text):
+    usr_agent = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/61.0.3163.100 Safari/537.36'
+        }
+    text = text.replace(" ", '+')
+    url = f'https://www.google.com/search?q={text}'
+    response = requests.get(url, headers=usr_agent)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'html.parser')
+    titles = soup.find_all( 'h3' )
+    return [title.getText() for title in titles]
+
 async def broadcast_messages(user_id, message):
     try:
         await message.copy(chat_id=user_id)
@@ -168,19 +181,6 @@ async def broadcast_messages_group(chat_id, message):
         return await broadcast_messages_group(chat_id, message)
     except Exception as e:
         return False, "Error"
-
-async def search_gagala(text):
-    usr_agent = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/61.0.3163.100 Safari/537.36'
-        }
-    text = text.replace(" ", '+')
-    url = f'https://www.google.com/search?q={text}'
-    response = requests.get(url, headers=usr_agent)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, 'html.parser')
-    titles = soup.find_all( 'h3' )
-    return [title.getText() for title in titles]
 
 
 async def get_settings(group_id):
@@ -310,6 +310,62 @@ def split_quotes(text: str) -> List:
         key = text[0] + text[0]
     return list(filter(None, [key, rest]))
 
+def gfilterparser(text, keyword):
+    if "buttonalert" in text:
+        text = (text.replace("\n", "\\n").replace("\t", "\\t"))
+    buttons = []
+    note_data = ""
+    prev = 0
+    i = 0
+    alerts = []
+    for match in BTN_URL_REGEX.finditer(text):
+        # Check if btnurl is escaped
+        n_escapes = 0
+        to_check = match.start(1) - 1
+        while to_check > 0 and text[to_check] == "\\":
+            n_escapes += 1
+            to_check -= 1
+
+        # if even, not escaped -> create button
+        if n_escapes % 2 == 0:
+            note_data += text[prev:match.start(1)]
+            prev = match.end(1)
+            if match.group(3) == "buttonalert":
+                # create a thruple with button label, url, and newline status
+                if bool(match.group(5)) and buttons:
+                    buttons[-1].append(InlineKeyboardButton(
+                        text=match.group(2),
+                        callback_data=f"gfilteralert:{i}:{keyword}"
+                    ))
+                else:
+                    buttons.append([InlineKeyboardButton(
+                        text=match.group(2),
+                        callback_data=f"gfilteralert:{i}:{keyword}"
+                    )])
+                i += 1
+                alerts.append(match.group(4))
+            elif bool(match.group(5)) and buttons:
+                buttons[-1].append(InlineKeyboardButton(
+                    text=match.group(2),
+                    url=match.group(4).replace(" ", "")
+                ))
+            else:
+                buttons.append([InlineKeyboardButton(
+                    text=match.group(2),
+                    url=match.group(4).replace(" ", "")
+                )])
+
+        else:
+            note_data += text[prev:to_check]
+            prev = match.start(1) - 1
+    else:
+        note_data += text[prev:]
+
+    try:
+        return note_data, buttons, alerts
+    except:
+        return note_data, buttons, None
+
 def parser(text, keyword):
     if "buttonalert" in text:
         text = (text.replace("\n", "\\n").replace("\t", "\\t"))
@@ -390,27 +446,24 @@ def humanbytes(size):
         size /= power
         n += 1
     return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
-    
-async def get_shortlink(link):
-    https = link.split(":")[0]
-    if "http" == https:
-        https = "https"
-        link = link.replace("http", https)
-    url = f'https://{URL_SHORTENR_WEBSITE}/api'
-    params = {'api': URL_SHORTNER_WEBSITE_API,
-              'url': link,
-              }
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, raise_for_status=True, ssl=False) as response:
-                data = await response.json()
-                if data["status"] == "success":
-                    return data['shortenedUrl']
-                else:
-                    logger.error(f"Error: {data['message']}")
-                    return f'https://{URL_SHORTENR_WEBSITE}/api?api={URL_SHORTNER_WEBSITE_API}&link={link}'
-
-    except Exception as e:
-        logger.error(e)
-        return f'{URL_SHORTENR_WEBSITE}/api?api={URL_SHORTNER_WEBSITE_API}&link={link}'
+def get_readable_time(seconds: int) -> str:
+    count = 0
+    up_time = ""
+    time_list = []
+    time_suffix_list = ["s", "m", "h", "days"]
+    while count < 4:
+        count += 1
+        remainder, result = divmod(seconds, 60) if count < 3 else divmod(seconds, 24)
+        if seconds == 0 and remainder == 0:
+            break
+        time_list.append(int(result))
+        seconds = int(remainder)
+    hmm = len(time_list)
+    for x in range(hmm):
+        time_list[x] = str(time_list[x]) + time_suffix_list[x]
+    if len(time_list) == 4:
+        up_time += f"{time_list.pop()}, "
+    time_list.reverse()
+    up_time += ":".join(time_list)
+    return up_time
